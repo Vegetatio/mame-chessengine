@@ -9,6 +9,28 @@ exports.license = "The BSD 3-Clause License"
 exports.author = { name = "Sandro Ronco" }
 
 
+-- Time Conrol.
+local Zeit=nil
+local ZeitDiff=10
+local SendStop = false
+
+-- Info Control.
+local SendInfo =os.clock() 
+local StartRollInfo=false
+local EmuspeedFaktor
+
+local Emuspeed=true -- false = unlimited speed
+
+
+-- Move Info, needed for move back
+local Move_Nr=0
+local Move_attr={}
+local All_Moves=""
+local last_move=""
+local sensorboard = ""
+
+local Akt_Move="" -- needed for go. (not 'position startpos ..' send sen move to the device. 'go movetime ...' send themoveto the device
+
 local plugin_path = ""
 local protocol = ""
 local co = nil
@@ -22,7 +44,6 @@ local my_color = "B"
 local ply = "W"
 local piece_from = nil
 local piece_to = nil
-local prev_move = nil
 local scr = [[
 	while true do
 		_G.status = io.stdin:read("*line")
@@ -31,7 +52,7 @@ local scr = [[
 ]]
 
 local function describe_system()
-	return manager:machine():system().description .. " (" .. emu.app_name() .. " " .. emu.app_version() .. ")"
+	return manager:machine():system().description --.. " (" .. emu.app_name() .. " " .. emu.app_version() .. ")"
 end
 
 local function board_reset()
@@ -42,8 +63,19 @@ local function board_reset()
 	ply = "W"
 	piece_from = nil
 	piece_to = nil
-	prev_move = nil
+  
+  -- TimeConrol
+  Zeit=nil
+  ZeitDiff=10
+  SendStop = false
 
+-- Move Info, need it for move back
+  Move_Nr=0
+  Move_attr={}
+  All_Moves=""
+  last_move=""
+  Akt_Move=""
+  
 	board = {{ 3, 5, 4, 2, 1, 4, 5, 3 },
 		{  6, 6, 6, 6, 6, 6, 6, 6 },
 		{  0, 0, 0, 0, 0, 0, 0, 0 },
@@ -53,9 +85,6 @@ local function board_reset()
 		{ -6,-6,-6,-6,-6,-6,-6,-6 },
 		{ -3,-5,-4,-2,-1,-4,-5,-3 }}
 
-	if interface.setup_machine then
-		interface.setup_machine()
-	end
 end
 
 local function move_to_pos(move)
@@ -87,10 +116,16 @@ local function promote_pawn(pos, piece, promotion)
 	end
 end
 
-local function send_input(tag, mask, seconds)
+local function send_input(tag, mask, seconds,tag1,mask1) -- tag1,mask1 required to push down to keys 
 	manager:machine():ioport().ports[tag]:field(mask):set_value(1)
+  if tag1 ~=nil then
+    manager:machine():ioport().ports[tag1]:field(mask1):set_value(1)
+  end
 	emu.wait(seconds * 2 / 3)
 	manager:machine():ioport().ports[tag]:field(mask):set_value(0)
+  if tag1 ~= nil then
+    manager:machine():ioport().ports[tag1]:field(mask1):set_value(0)
+  end
 	emu.wait(seconds * 1 / 3)
 end
 
@@ -120,10 +155,10 @@ local function sb_promote(tag, x, y, piece)
 		mask = mask << 6
 	end
 
-	send_input(tag .. ":SPAWN", mask, 0.09)
+	send_input(tag .. ":SPAWN", mask, 0.5)
 	if (manager:machine():outputs():get_value("piece_ui0") ~= 0) then
 		sb_set_ui(tag, 0x0002, 1)
-		send_input(tag .. ":RANK." .. tostring(y), 1 << (x - 1), 0.09)
+		send_input(tag .. ":RANK." .. tostring(y), 1 << (x - 1), 0.5)
 		sb_set_ui(tag, 0x0002, 0)
 	end
 end
@@ -133,6 +168,20 @@ local function sb_remove_piece(tag, x, y)
 	send_input(tag .. ":RANK." .. tostring(y), 1 << (x - 1), 0.09)
 	sb_set_ui(tag, 0x0002, 0)
 	send_input(tag .. ":UI", 0x0008, 0.09)	-- SensorBoard REMOVE
+end
+
+local function piece_in_hand(piece)
+      if (piece == 2) then send_input(sensorboard .. ":SPAWN", 0x0010,1) --queen
+      elseif (piece == 4) then send_input(sensorboard .. ":SPAWN", 0x0004,1) -- bishop
+      elseif(piece == 3) then send_input(sensorboard .. ":SPAWN", 0x0008,1) --rook
+      elseif (piece == 5)then send_input(sensorboard .. ":SPAWN", 0x0002,1) --knight
+      elseif (piece == -2) then send_input(sensorboard .. ":SPAWN", 0x0400,1) --queen
+      elseif  (piece == -4) then send_input(sensorboard .. ":SPAWN", 0x0100,1) --bishop
+      elseif (piece == -3) then send_input(sensorboard .. ":SPAWN", 0x0200,1) --rook
+      elseif (piece == -5) then send_input(sensorboard .. ":SPAWN", 0x0080,1) --knight
+      elseif (piece == 6) then send_input(sensorboard .. ":SPAWN", 0x0001,1) --pawn
+      elseif (piece == -6) then send_input(sensorboard .. ":SPAWN", 0x0040,1) --pawn
+      end
 end
 
 local function sb_select_piece(tag, seconds, x, y, event)
@@ -151,6 +200,7 @@ local function sb_move_piece(tag, x, y)
 end
 
 local function sb_reset_board(tag)
+  sensorboard=tag
 	send_input(tag .. ":UI", 0x0200, 0.09)	-- SensorBoard RESET
 end
 
@@ -198,23 +248,38 @@ local function recv_cmd()
 end
 
 local function send_cmd(cmd)
-	io.stdout:write(cmd .. "\n")
-	io.stdout:flush()
+  if cmd ~= "" then
+    io.stdout:write(cmd .. "\n")
+    io.stdout:flush()
+  end
+end
+
+local function round(num)
+  local numDecimalPlaces=1
+  local mult = 10^(numDecimalPlaces or 0)
+  return math.floor(num * mult + 0.5) / mult
 end
 
 local function send_move(move)
-	prev_move = move
+  manager:machine():video().throttled = false -- speed up the move transfer
+  All_Moves=(All_Moves .. " " .. move)
 	if (protocol == "xboard") then
 		send_cmd("move " .. move)
 	elseif (protocol == "uci") then
 		send_cmd("bestmove " .. move)
 	end
+  Zeit=os.clock()
+  SendStop=false
+  StartRollInfo=false
+  manager:machine():video().throttled = Emuspeed
 end
 
 local function make_move(move, reason, promotion)
+  manager:machine():video().throttled = false
 	local from = move_to_pos(move:sub(1, 2))
 	local to = move_to_pos(move:sub(3, 4))
-
+  Move_attr[Move_Nr]=board[to.y][to.x]
+  Zeit=os.clock()
 	if interface.select_piece then
 		if not piece_get then
 			interface.select_piece(from.x, from.y, "get" .. reason)
@@ -223,26 +288,31 @@ local function make_move(move, reason, promotion)
 		if board[to.y][to.x] ~= 0 then
 			interface.select_piece(to.x, to.y, "capture")
 		end
-
 		interface.select_piece(to.x, to.y, "put" .. reason)
 	end
-
 	piece_get = false
 	sel_started = false
-
 	-- castling
-	if     (board[from.y][from.x] ==  1 and move == "e1g1") then make_move("h1f1", "_castling", false)
-	elseif (board[from.y][from.x] ==  1 and move == "e1c1") then make_move("a1d1", "_castling", false)
-	elseif (board[from.y][from.x] == -1 and move == "e8g8") then make_move("h8f8", "_castling", false)
-	elseif (board[from.y][from.x] == -1 and move == "e8c8") then make_move("a8d8", "_castling", false)
+	if (board[from.y][from.x] ==  1 and move == "e1g1") then 
+    make_move("h1f1", "_castling", false)
+    Move_attr[Move_Nr]=11
+  elseif (board[from.y][from.x] ==  1 and move == "e1c1") then 
+    make_move("a1d1", "_castling", false)
+    Move_attr[Move_Nr]=11
+  elseif (board[from.y][from.x] == -1 and move == "e8g8") then 
+    make_move("h8f8", "_castling", false)
+    Move_attr[Move_Nr]=20
+  elseif (board[from.y][from.x] == -1 and move == "e8c8") then
+    make_move("a8d8", "_castling", false)
+    Move_attr[Move_Nr]=21
 	else
-		-- next ply
+    	-- next ply
 		if (ply == "W") then
 			ply = "B"
 		else
 			ply = "W"
 		end
-	end
+  end
 
 	-- en passant
 	if board[to.y][to.x] == 0 and board[from.y][from.x] == -6 and from.y == 4 and to.y == 3 and from.x ~= to.x and board[to.y + 1][to.x] == 6 then
@@ -251,114 +321,254 @@ local function make_move(move, reason, promotion)
 			emu.wait(0.5)
 		end
 		board[to.y + 1][to.x] = 0
+    Move_attr[Move_Nr]=25
 	elseif board[to.y][to.x] == 0 and board[from.y][from.x] == 6  and from.y == 5 and to.y == 6 and from.x ~= to.x and board[to.y - 1][to.x] == -6 then
 		if interface.select_piece then
 			interface.select_piece(to.x, to.y - 1, "en_passant")
 			emu.wait(0.5)
 		end
 		board[to.y - 1][to.x] = 0
+    Move_attr[Move_Nr]=26
 	end
 
 	board[to.y][to.x] = board[from.y][from.x]
 	board[from.y][from.x] = 0
 
 	-- promotion
+  
 	if (move:len() >= 5) then
-		promote_pawn(to, move:sub(move:len()), promotion)
+    if ply==my_color then promotion=true end
+    promote_pawn(to, move:sub(move:len()), promotion)
 	end
+  
+   Zeit=os.clock()
+   SendInfo=os.clock()
+  manager:machine():video().throttled = Emuspeed
 end
 
+local function move_back(move)
+  last_move=move
+  if interface.go_back then
+    interface.go_back()
+		local from = move_to_pos(last_move:sub(3, 4))
+		local to = move_to_pos(last_move:sub(1, 2))
+		local cap =tonumber(last_move:sub(5,6)) 
+    interface.select_piece(from.x, from.y, "get")
+    emu.wait(0.5)
+    interface.select_piece(to.x, to.y, "put")
+     board[to.y][to.x] = board[from.y][from.x]
+     board[from.y][from.x]=0
+     if cap ~= 0 then
+       if cap < 10 then
+         piece_in_hand(Move_attr[Move_Nr])
+        interface.select_piece(from.x, from.y, "put")-- capture move	
+         board[from.y][from.x] = cap
+       elseif cap == 10 then
+         last_move=("f1h1")							
+         from = move_to_pos(last_move:sub(1,2))
+         to = move_to_pos(last_move:sub(3,4))
+        interface.select_piece(from.x, from.y, "get")
+        interface.select_piece(to.x, to.y, "put")
+         board[to.y][to.x] = board[from.y][from.x]
+         board[from.y][from.x]=0
+       elseif cap ==11 then						
+         last_move=("d1a1")						
+         from = move_to_pos(last_move:sub(1,2))
+         to = move_to_pos(last_move:sub(3,4))
+           interface.select_piece(from.x, from.y, "get")
+        interface.select_piece(to.x, to.y, "put")
+        board[to.y][to.x] = board[from.y][from.x]
+         board[from.y][from.x]=0
+       elseif cap ==20 then					
+         last_move=("f8h8")						
+         from = move_to_pos(last_move:sub(1,2))
+         to = move_to_pos(last_move:sub(3,4))
+           interface.select_piece(from.x, from.y, "get")
+        interface.select_piece(to.x, to.y, "put")
+         board[to.y][to.x] = board[from.y][from.x]
+         board[from.y][from.x]=0
+       elseif cap ==11 then						
+         last_move=("d8a8")						
+         from = move_to_pos(last_move:sub(1,2))
+         to = move_to_pos(last_move:sub(3,4))
+          interface.select_piece(from.x, from.y, "get")
+        interface.select_piece(to.x, to.y, "put")
+         board[to.y][to.x] = board[from.y][from.x]
+         board[from.y][from.x]=0
+       elseif cap ==26 then								--en passant -6
+         piece_in_hand(-6)
+       interface.select_piece(from.x, from.y-1, "put")
+         board[to.y-1][to.x] = -6
+       elseif cap ==25 then								--en passant 6
+         piece_in_hand(6)
+         interface.select_piece(from.x, from.y+1, "put")
+         board[to.y+1][to.x] = 6
+       elseif cap ==50 then	-- white promotion
+        piece_in_hand(6)
+           interface.select_piece(to.x, to.y, "put")
+        board[to.y][to.x] =6
+       elseif cap ==70 then								-- black promotion
+        piece_in_hand(-6)
+         interface.select_piece(to.x, to.y, "put")
+        board[to.y][to.x] =-6
+       elseif cap >50 then
+         if cap<65 then							-- white promotion with capture
+           piece_in_hand(6)
+              interface.select_piece(to.x, to.y, "put")
+           piece_in_hand(cap-50)
+            interface.select_piece(to.x, to.y, "put")
+           board[from.y][from.x]=cap-50
+           board[to.y][to.x]=6
+         else									-- black promotion with capture
+           piece_in_hand(-6)
+          interface.select_piece(to.x, to.y, "put")
+           piece_in_hand(cap-70)
+            interface.select_piece(to.x, to.y, "put")
+           board[from.y][from.x]=cap-70
+          board[from.y][from.x]=-6
+         end
+       end
+     else
+       board[from.y][from.x] = 0
+     end
+     if (ply == "W") then
+       ply = "B"
+       my_color="W"
+     else
+       ply = "W"
+       my_color="B"
+     end
+     last_move=""
+     piece_from = nil
+     piece_to = nil
+     interface.go_back(1) -- required if after move back need the device a key
+    end
+  end
+  
 local function search_selected_piece()
-	local active_fpos = 0
-	local active_tpos = 0
-	local board_sel = {}
-	if (interface.is_selected) then
-		for y=1,8 do
-			for x=1,8 do
-				board_sel[y*8 + x] = interface.is_selected(x, y)
-				if board_sel[y*8 + x] and ((board[y][x] < 0 and ply == "B") or (board[y][x] > 0 and ply == "W")) then
-					piece_from = {x = x, y = y}
-					active_fpos = active_fpos + 1
-				end
-			end
-		end
-		if (piece_from ~= nil) then
-			for y=1,8 do
-				for x=1,8 do
-					if board_sel[y*8 + x] and (board[y][x] == 0 or (board[y][x] < 0 and ply == "W") or (board[y][x] > 0 and ply == "B")) then
-						piece_to = {x = x, y = y}
-						active_tpos = active_tpos + 1
-					end
-				end
-			end
-		end
-	end
-
+  if my_color==ply then
+    local active_fpos = 0
+    local active_tpos = 0
+    local board_sel = {}
+    if (interface.is_selected) then
+      for y=1,8 do
+        for x=1,8 do
+          board_sel[y*8 + x] = interface.is_selected(x, y)
+          if board_sel[y*8 + x] and ((board[y][x] < 0 and ply == "B") or (board[y][x] > 0 and ply == "W")) then
+            piece_from = {x = x, y = y}
+            active_fpos = active_fpos + 1
+          end
+        end
+      end
+      if (piece_from ~= nil) then
+        for y=1,8 do
+          for x=1,8 do
+            if board_sel[y*8 + x] and (board[y][x] == 0 or (board[y][x] < 0 and ply == "W") or (board[y][x] > 0 and ply == "B")) then
+              piece_to = {x = x, y = y}
+              active_tpos = active_tpos + 1
+            end
+          end
+        end
+      end
+    end
 	-- If there are more than 2 selections, something is wrong
-	if active_tpos > 1 or active_fpos > 1 or (piece_from ~= nil and piece_to ~= nil and piece_from.x == piece_to.x and piece_from.y == piece_to.y) then
-		piece_from = nil
-		piece_to = nil
-	end
+    if active_tpos > 1 or active_fpos > 1 or (piece_from ~= nil and piece_to ~= nil and piece_from.x == piece_to.x and piece_from.y == piece_to.y) then
+      piece_from = nil
+      piece_to = nil
+    end
 
 	-- in some systems LEDs flash for a bit after the search is completed, wait for 1 second should allow thing to stabilize
-	if (not sel_started and (piece_from or piece_to)) then
-		sel_started = true
-		emu.wait(1)
-		piece_from = nil
-		piece_to = nil
-	end
-
-	if not piece_get and piece_from ~= nil and piece_to == nil then
-		piece_get = true
-		if interface.select_piece then
-			interface.select_piece(piece_from.x, piece_from.y, "get")
-			emu.wait(0.5)
-		end
-	end
-
-	if piece_to ~= nil and piece_from ~= nil then
-		local rows = { "a", "b", "c", "d", "e", "f", "g", "h" }
-		local move = rows[piece_from.x] .. tostring(piece_from.y)
-		move = move .. rows[piece_to.x] .. tostring(piece_to.y)
-		local need_promotion = (piece_to.y == 8 and board[piece_from.y][piece_from.x] == 6) or (piece_to.y == 1 and board[piece_from.y][piece_from.x] == -6)
-
-		-- promotion
-		if (need_promotion) then
-			local new_type = "q"	-- default to Queen
-			if interface.get_promotion then
-				new_type = interface.get_promotion(piece_to.x, piece_to.y)
-			end
-
-			if (new_type ~= nil) then
-				move = move .. new_type
-				need_promotion = false
-				send_move(move)
-			end
-		else
-			send_move(move)
-		end
-
-		make_move(move, "", false)
-
-		-- some machines show the promotion only after the pawn has been moved
-		if (need_promotion) then
-			local new_type = nil
-			if interface.get_promotion then
-				new_type = interface.get_promotion(piece_to.x, piece_to.y)
-			end
-
-			if (new_type == nil) then
-				manager:machine():logerror(manager:machine():system().name .. " Unable to determine the promotion")
-				new_type = "q"	-- default to Queen
-			end
-
-			promote_pawn(piece_to, new_type, false)
-			move = move .. new_type
-			send_move(move)
-		end
-	end
+    if (not sel_started and (piece_from or piece_to)) then
+      sel_started = true
+      emu.wait(1)
+      piece_from = nil
+      piece_to = nil
+    end
+    if not piece_get and piece_from ~= nil and piece_to == nil then
+      SendStop=true
+      piece_get = true
+      if interface.select_piece then
+        interface.select_piece(piece_from.x, piece_from.y, "get")
+        emu.wait(0.5)
+      end
+    end
+  end
+  if piece_to ~= nil and piece_from ~= nil then
+    manager:machine():video().throttled = false
+    SendStop=true
+    if interface.show_after_move then
+      send_cmd("info score bk " .. interface.show_after_move())
+    end
+    local rows = { "a", "b", "c", "d", "e", "f", "g", "h" }
+    local move = rows[piece_from.x] .. tostring(piece_from.y)
+    move = move .. rows[piece_to.x] .. tostring(piece_to.y)
+    local need_promotion = (piece_to.y == 8 and board[piece_from.y][piece_from.x] == 6) or (piece_to.y == 1 and board[piece_from.y][piece_from.x] == -6)
+   
+   
+  -- promotion
+    if (need_promotion) then
+      local new_type = "q"	-- default to Queen
+      if interface.get_promotion then
+        new_type = interface.get_promotion(piece_to.x, piece_to.y)
+      end
+      if (new_type ~= nil) then
+        move = move .. new_type
+        need_promotion = false
+        send_move(move)
+      end
+    else
+      send_move(move)
+    end
+    Move_Nr=Move_Nr+1
+    make_move(move, "", false)
+    -- some machines show the promotion only after the pawn has been moved
+    if (need_promotion) then
+      local new_type = nil
+      if interface.get_promotion then
+        new_type = interface.get_promotion(piece_to.x, piece_to.y)
+      end
+      if (new_type == nil) then
+        manager:machine():logerror(manager:machine():system().name .. " Unable to determine the promotion")
+        new_type = "q"	-- default to Queen
+      end
+      promote_pawn(piece_to, new_type, false)
+      move = move .. new_type
+      send_move(move)
+    end
+     manager:machine():video().throttled = Emuspeed
+  else
+    EmuspeedFaktor= (round(tonumber(manager:machine():video():speed_percent()) )) -- read the speed and send it as hashfull
+    if Zeit ~= nil and ZeitDiff ~=nil and SendStop == false and ply == my_color then
+      local Aktuelle_Zeit = os.clock()
+      if (Aktuelle_Zeit - Zeit)>=ZeitDiff then
+        if interface.stop_play then
+          SendStop=true
+          interface.stop_play()
+          -- send_cmd("stopped by time control") -- for tests
+        elseif interface.start_play then
+          SendStop=true
+          interface.start_play()
+          -- send_cmd("stopped by time control")
+        end
+      elseif (Aktuelle_Zeit - Zeit) >= 2 and (Aktuelle_Zeit - Zeit) <= (ZeitDiff-2) and piece_to == nil and piece_from == nil and (Aktuelle_Zeit - SendInfo) >=0.75/EmuspeedFaktor then
+        if StartRollInfo==false and interface.Start_Roll_Info then --if the device has a rolling info display
+          StartRollInfo=true
+          interface.Start_Roll_Info()
+        end
+        if interface.show_info then
+          local info=interface.show_info(ply) -- to show the score depth and pv
+          if info~="" then
+            send_cmd(info .. " hashfull " ..(tostring(EmuspeedFaktor*100)):gsub("%.",""))
+          end
+       else
+         send_cmd("info score cp 000 depth 1 currmovenumber 1 hashfull " .. (tostring(EmuspeedFaktor*100)):gsub("%.",""))
+        end
+        SendInfo=os.clock()
+      end
+    end
+  end
 end
-
+ 
 local function send_options()
 	local tag_default = ""
 	local tag_min = " "
@@ -408,9 +618,13 @@ local function set_option(name, value)
 	if (string.lower(name) == "speed") then
 		if (tonumber(value) == 0) then	-- 0 = unlimited
 			manager:machine():video().throttled = false
+      manager:machine():video().frameskip=10 -- max. spped
+      Emuspeed = false
 		else
 			manager:machine():video().throttled = true
 			manager:machine():video().throttle_rate = tonumber(value) / 100.0
+      manager:machine():video().frameskip=9 -- some engine ignore throttle if frameskip =10
+      Emuspeed = true
 		end
 	elseif (interface.set_option) then
 		interface.set_option(string.lower(name), value)
@@ -419,35 +633,131 @@ end
 
 local function execute_uci_command(cmd)
 	if cmd == "uci" then
+    send_cmd("\n" .. "id name " .. describe_system())
+    math.randomseed(os.time()) 
 		protocol = cmd
-		send_cmd("id name " .. describe_system())
+    local Speed=Emuspeed
+    Emuspeed=false
+    manager:machine():video().throttle_rate =1
+    manager:machine():video().frameskip=10
+    manager:machine():video().throttled = false -- quickly setup
+    if interface.setup_machine then
+      interface.setup_machine()
+    end
+    	 if interface.get_options then
+    		 send_options()
+		   end
+    board_reset()
 		send_cmd("option name Speed type spin default 100 min 0 max 10000")
-		if interface.get_options then
-			send_options()
-		end
+    manager:machine():video().throttled = Speed
+    if Speed==true then manager:machine():video().frameskip=9 end
 		send_cmd("uciok")
+    Emuspeed=Speed
 	elseif cmd == "isready" then
 		send_cmd("readyok")
 	elseif cmd == "ucinewgame" then
-		if game_started == true then
-			game_started = false
-			manager:machine():soft_reset()
-		end
+    game_started = false
+    manager:machine():video().throttled = false -- quickly setup
+    if interface.setup_machine then
+      interface.setup_machine()
+    end
 		board_reset()
-	elseif cmd == "quit" then
+    emu.wait(math.random(2,20)/10) -- because some engine plays always the same in Arena Tournament.
+    manager:machine():video().throttled = Emuspeed
+  elseif cmd == "quit" then
 		manager:machine():exit()
 	elseif cmd:match("^go") ~= nil then
 		if board == nil then
 			board_reset()
 		end
-		if game_started == false or my_color ~= ply then
-			if interface.start_play then
-				interface.start_play(not game_started)
-			end
-			my_color = ply
-			game_started = true
-			sel_started = false
-		end
+    if my_color ~= ply then
+      if Akt_Move ~="" then
+        make_move(Akt_Move, "", true) -- send the move to the device
+        Akt_Move=""
+        piece_from = nil
+        piece_to = nil
+        piece_get=nil
+        sel_started = false
+      else
+        Akt_Move=""
+        if interface.start_play then
+          interface.start_play(not game_started)
+        end
+        game_started = true
+        my_color = ply
+      end
+    end
+    if cmd:match("^go movetime") then -- time per move
+      local Diff
+      for i in string.gmatch(cmd, "%S+") do
+        Diff=i
+      end
+      ZeitDiff=tonumber(Diff)
+      ZeitDiff=ZeitDiff/1000
+    elseif cmd:match("go wtime") then -- without movestoge = time for the game 
+      local ZeitW=5
+      local ZeitS=5
+      local Farbe
+      local Zugkontrolle=nil
+      local BBonus=0
+      local WBonus=0
+      for i in string.gmatch(cmd, "%S+") do
+        if i == "wtime" then 
+          Farbe="W"
+        elseif i == "movestogo" then -- tournament level
+          Farbe = "M"
+        elseif i == "btime" then
+          Farbe="S"
+        elseif i == "winc" then -- bonus time
+          Farbe="WINC"
+        elseif i == "binc" then 
+          Farbe="BINC"
+        elseif Farbe == "W" then
+          ZeitW=tonumber(i)
+          ZeitW=ZeitW/1000
+          Farbe=""
+        elseif Farbe == "S" then
+          ZeitS=tonumber(i)
+          ZeitS=ZeitS/1000
+          Farbe=""
+        elseif Farbe == "WINC" then
+          WBonus=tonumber(i)
+          WBonus=WBonus/1000
+          Farbe=""
+        elseif Farbe == "BINC" then
+          BBonus=tonumber(i)
+          BBonus=BBonus/1000
+          Farbe=""
+        elseif Farbe == "M" then
+          Zugkontrolle=tonumber(i)
+          Farbe=""
+        
+        end
+      end
+      if my_color=="W" then
+        ZeitDiff=ZeitW
+      else
+        ZeitDiff=ZeitS
+      end
+    
+      if Zugkontrolle~=nil then
+        ZeitDiff=ZeitDiff/Zugkontrolle
+      else
+        if Move_Nr>=140 then
+           ZeitDiff=ZeitDiff/(280-Move_Nr)
+        else
+          ZeitDiff=ZeitDiff/(140-Move_Nr)
+        end
+      end
+        if my_color=="W" then
+        ZeitDiff=ZeitDiff+WBonus
+      else
+        ZeitDiff=ZeitDiff+BBonus
+      end
+    end
+    if ZeitDiff<=4 then ZeitDiff=4 end
+     Zeit=os.clock()
+    manager:machine():video().throttled = Emuspeed
 	elseif cmd:match("^setoption name ") ~= nil then
 		local opt_name, opt_val = string.match(cmd:sub(16), '(.+) value (.+)')
 		if     (string.lower(opt_val) == "true" ) then opt_val = "1"
@@ -455,26 +765,67 @@ local function execute_uci_command(cmd)
 		end
 		set_option(opt_name, opt_val)
 	elseif cmd:match("^position startpos moves") ~= nil then
-		if board == nil then
-			board_reset()
-		end
+    manager:machine():video().throttled = false
+    Akt_Move=""
 		game_started = true
-		local last_move = ""
+    cmd=cmd.gsub(cmd,"position startpos moves","")
+    if All_Moves~=cmd then 
+      while (string.len(cmd) <= string.len(All_Moves)) -- move back ?
+      do
+        for i in string.gmatch(All_Moves, "%S+") do
+          last_move = i
+        end
+        All_Moves=All_Moves:sub(1,string.len(All_Moves)-string.len(last_move))
+        if All_Moves:sub(string.len(All_Moves),string.len(All_Moves)) ==" " then
+          All_Moves=All_Moves:sub(1,string.len(All_Moves)-1)
+        end
+        if All_Moves=="position startpos moves" then
+          All_Moves=""
+        end
+        last_move=last_move .. Move_attr[Move_Nr]
+        move_back(last_move)
+        Move_Nr=Move_Nr-1
+      end
+    
+    local ZNR =0
 		for i in string.gmatch(cmd, "%S+") do
 			last_move = i
+      ZNR = ZNR+1
 		end
-		if (last_move == prev_move) then
-			my_color = ply
-			sel_started = false
-			if interface.start_play then
-				interface.start_play(not game_started)
-			end
-		else
-			make_move(last_move, "", true)
-			piece_from = nil
-			piece_to = nil
-			sel_started = false
+    if (All_Moves == "") and (ZNR >= 2) then -- for move forward
+			if interface.player_vs_player_mode then 
+				interface.player_vs_player_mode()
+				emu.wait(0,5)
+				ply="W"
+				ZNR=0
+				for i in string.gmatch(cmd, "%S+") do
+					last_move = i
+					ZNR = ZNR + 1
+          Move_Nr=Move_Nr+1
+          make_move(last_move, "", false)
+				end
+        if ply=="W" then
+          my_color="B"
+        else
+          my_color="W"
+        end
+				if interface.player_vs_player_off then
+				  interface.player_vs_player_off()
+				else
+				  interface.player_vs_player_mode()
+			  end
+				game_started = false
+				piece_from = nil
+				piece_to = nil
+        All_Moves=cmd
+      end
+  elseif  (All_Moves) ~= cmd  then
+      Move_Nr=Move_Nr+1
+      Akt_Move=last_move
+       All_Moves=cmd
 		end
+  end
+  manager:machine():video().throttled = Emuspeed
 	elseif cmd == "stop" then
 		if game_started == true then
 			if interface.stop_play then
@@ -483,6 +834,11 @@ local function execute_uci_command(cmd)
 				interface.start_play(not game_started)
 			end
 		end
+    elseif cmd:match("^info") ~= nil then -- only for tests
+         if interface.show_info then
+            send_cmd("white:" .. "\n" .. interface.show_info("W"))
+             send_cmd("black:" .. "\n" .. interface.show_info("B"))
+          end
 	else
 		manager:machine():logerror("Unhandled UCI command '" .. cmd .. "'")
 	end
@@ -510,18 +866,16 @@ local function execute_xboard_command(cmd)
 			board_reset()
 		end
 		sel_started = false
-		if game_started == false or my_color ~= ply then
-			if interface.start_play then
+		if my_color ~= ply then
+      if interface.start_play then
 				interface.start_play(not game_started)
-			end
+      end
 			game_started = true
 			my_color = ply
 		end
-	elseif (cmd == "?") then
-		if interface.stop_play then
+	elseif (cmd == "stop") then
+		if interface.stop_play and my_color==ply then
 			interface.stop_play()
-		elseif interface.start_play then
-			interface.start_play(not game_started)
 		end
 	elseif cmd == "quit" then
 		manager:machine():exit()
