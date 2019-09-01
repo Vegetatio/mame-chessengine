@@ -285,6 +285,11 @@ local function make_move(move, reason, promotion)
 			interface.select_piece(from.x, from.y, "get" .. reason)
 			emu.wait(0.5)
 		end
+    if (move:len() >= 5) then
+      if ply~=my_color and interface.promote_special then 
+        interface.promote_special(move:sub(move:len())) -- some engine need at promotion the piece between from and to
+      end 
+    end
 		if board[to.y][to.x] ~= 0 then
 			interface.select_piece(to.x, to.y, "capture")
 		end
@@ -795,7 +800,7 @@ local function execute_uci_command(cmd)
     if (All_Moves == "") and (ZNR >= 2) then -- for move forward
 			if interface.player_vs_player_mode then 
 				interface.player_vs_player_mode()
-				emu.wait(0,5)
+        emu.wait(0,5)
 				ply="W"
 				ZNR=0
 				for i in string.gmatch(cmd, "%S+") do
@@ -814,7 +819,7 @@ local function execute_uci_command(cmd)
 				else
 				  interface.player_vs_player_mode()
 			  end
-				game_started = false
+				game_started = true 
 				piece_from = nil
 				piece_to = nil
         All_Moves=cmd
